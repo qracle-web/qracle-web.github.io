@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>QRACLE OPFS Browser - Serverless OS</title>
+<style>
+  body{margin:0;background:#050505;color:#ddd;font-family:monospace;display:flex;flex-direction:column;min-height:100vh}
+  header{padding:10px 14px;background:#101010;border-bottom:1px solid #222;display:flex;gap:10px;align-items:center}
+  .dot{width:8px;height:8px;border-radius:50%;background:#0f0;box-shadow:0 0 6px #0f0}
+  .path{font-size:11px;color:#888;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
+  #bar{padding:6px 14px;background:#0a0a0a;border-bottom:1px solid #151515;font-size:11px;color:#666;display:flex;gap:12px}
+  #view{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow:auto}
+  #view img{max-width:100%;max-height:92vh;box-shadow:0 0 30px #000;border:1px solid #222}
+  #view video{max-width:100%;max-height:92vh;border:1px solid #222}
+  #view pre{max-width:900px;width:100%;background:#111;padding:20px;border:1px solid #222;border-radius:6px;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5}
+  .err{color:#f66;border:1px solid #533;background:#1a1111;padding:16px;border-radius:6px}
+  button{background:#1a1a1a;color:#aaa;border:1px solid #333;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px}
+  button:hover{background:#222;color:#fff}
+</style>
+</head>
+<body>
+<header><div class="dot"></div><b>QRACLE OPFS BROWSER</b><span class="path" id="p">p2p://...</span><button id="copy">p2p 복사</button><button id="dl">다운로드</button></header>
+<div id="bar"><span id="status">OPFS에서 직접 읽기 - serverless, no server, no blob: URL in address bar</span><span id="size"></span></div>
+<div id="view">OPFS 로딩 중...</div>
+<script type="module">
+const params = new URLSearchParams(location.search);
+let target = params.get('p') || params.get('path') || '';
+const safeParam = params.get('safe') || '';
+const chunkedParam = params.get('chunked') || '';
+const pEl = document.getElementById('p');
+const statusEl = document.getElementById('status');
+const sizeEl = document.getElementById('size');
+const viewEl = document.getElementById('view');
+
+function norm(p){
+  if(!p) return '';
+  if(p.startsWith('p2p://')){ const i=p.indexOf('/pub/'); if(i>=0) return p.slice(i+1); return p.replace(/^p2p:\/\/[^\/]+\//,''); }
+  if(p.startsWith('opfs://')) return p.replace(/^opfs:\/\//,'');
+  if(p.startsWith('blob:')) return '';
+  return p;
+}
+const opfsPath = norm(target);
+const p2pPath = `p2p://pub/qracle-market/objects/wasm/${opfsPath}`;
+pEl.textContent = target.startsWith('p2p://') ? target : p2pPath;
+
+let currentBytes = null;
+let currentMime = '';
+
+async function readFromOpfs(path){
+  const variants = [path, path.replace(/^pub\//,''), `pub/${path}`, path.replace(/^qracle-chat\//,'pub/qracle-chat/')];
+  for(const p of [...new Set(variants)]){
+    try{
+      const mod = await import('/src/storages/pglite_hub.ts');
+      if(mod.rawRead){
+        const r = await mod.rawRead(p).catch(()=>null);
+        if(r && (r instanceof Uint8Array ? r.length>0 : r.length>0)) return r;
+      }
+    }catch{}
+  }
+  try{
+    const {readFile} = await import('/src/storage.ts');
+    const r = await readFile(path).catch(()=>null);
+    if(r) return r;
+  }catch{}
+  try{
+    if(navigator.storage && navigator.storage.getDirectory){
+      const root = await navigator.storage.getDirectory();
+      const parts = path.split('/').filter(Boolean);
+      let dir = root;
+      for(let i=0;i<parts.length-1;i++){
+        dir = await dir.getDirectoryHandle(parts[i]).catch(()=>null);
+        if(!dir) break;
+      }
+      if(dir){
+        const fh = await dir.getFileHandle(parts[parts.length-1]).catch(()=>null);
+        if(fh){
+          const file = await fh.getFile();
+          return new Uint8Array(await file.arrayBuffer());
+        }
+      }
+    }
+  }catch{}
+  return null;
+}
+
+async function readChunk(safe, idx){
+  const pad = String(idx).padStart(6,'0');
+  const pgliteCandidates = [
+    `pub/qracle-chat/objects/${safe}/chunks/${pad}.bin`,
+    `qracle-chat/objects/${safe}/chunks/${pad}.bin`,
+    `pub/qracle-chat/objects/${safe}/chunks/${idx}.bin`,
+    `qracle-chat/objects/${safe}/chunks/${pad}.bin`.replace(/^pub\//,''),
+    `qracle-chat/objects/${safe}/chunks/${pad}.bin`,
+    `pub/qracle-chat/objects/${safe}/data/${pad}.bin`,
+  ];
+
+  // 1) PGlite hub - recv.ts와 동일한 경로
+  try{
+    const mod = await import('/src/storages/pglite_hub.ts').catch(()=>null)
+             || await import('/src/storage.ts').catch(()=>null)
+             || await import('../../storages/pglite_hub.ts').catch(()=>null);
+    if(mod && mod.rawRead){
+      for(const p of pgliteCandidates){
+        const r = await mod.rawRead(p).catch(()=>null);
+        if(r){
+          const u8 = r instanceof Uint8Array? r : new TextEncoder().encode(r);
+          if(u8.length>0) return u8;
+        }
+      }
+    }
+  }catch(e){ console.log('pglite read fail', e); }
+
+  // 2) 네이티브 OPFS API - qracle-web이 PGlite 말고 FileSystem API로 저장했을 경우
+  try{
+    if(navigator.storage && navigator.storage.getDirectory){
+      const root = await navigator.storage.getDirectory();
+      // pub/qracle-chat/objects/safe/chunks/000000.bin 탐색
+      const tryDirs = [
+        ['pub','qracle-chat','objects',safe,'chunks'],
+        ['qracle-chat','objects',safe,'chunks'],
+        ['pub','qracle-chat','objects',safe],
+      ];
+      for(const dirs of tryDirs){
+        try{
+          let dir = root;
+          for(const d of dirs){ dir = await dir.getDirectoryHandle(d); }
+          const fh = await dir.getFileHandle(`${pad}.bin`).catch(()=> dir.getFileHandle(`${idx}.bin`).catch(()=>null));
+          if(fh){
+            const file = await fh.getFile();
+            const buf = await file.arrayBuffer();
+            if(buf.byteLength>0) return new Uint8Array(buf);
+          }
+        }catch{}
+      }
+    }
+  }catch(e){ console.log('native OPFS chunk read fail', e); }
+
+  // 3) localStorage relay fallback
+  try{
+    const keys = [
+      `qracle:relay:pub/qracle-chat/objects/${safe}/chunks/${pad}.bin`,
+      `qracle:relay:qracle-chat/objects/${safe}/chunks/${pad}.bin`,
+      `qracle:relay:chunk:${safe}:${idx}:exists`
+    ];
+    for(const k of keys){
+      const b64 = localStorage.getItem(k);
+      if(b64 && b64.length>10){
+        try{
+          const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+          const arr = new Uint8Array(bin.length);
+          for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+          if(arr.length>0) return arr;
+        }catch{}
+      }
+    }
+  }catch{}
+
+  return null;
+}
+
+async function render(){
+  // chunked=1 이면 safe 파라미터로 직접 조립 - open.ts v10.5에서 넘겨줌
+  if(chunkedParam && safeParam){
+    statusEl.textContent = `Chunked video 조립: safe=${safeParam}`;
+    try{
+      // manifest 먼저 읽어서 chunkCount 확인
+      let manifest = null;
+      const mfData = await readFromOpfs(opfsPath);
+      if(mfData){
+        const txt = mfData instanceof Uint8Array ? new TextDecoder().decode(mfData) : mfData;
+        try{ manifest = JSON.parse(txt); }catch{}
+      }
+      const chunkCount = manifest?.chunkCount || parseInt(params.get('chunks')||'15');
+      const mime = manifest?.mime || params.get('mime') || 'video/mp4';
+      const name = manifest?.name || safeParam;
+
+      statusEl.textContent = `Chunked ${name} ${chunkCount} chunks 조립 중 - 4MB씩 OPFS 스트리밍 (serverless)`;
+      const chunks = [];
+      let total = 0;
+      for(let i=0;i<chunkCount;i++){
+        const c = await readChunk(safeParam, i);
+        if(!c){
+          viewEl.innerHTML = `<div class=err>청크 없음 idx=${i} safe=${safeParam}<br>qracle chat recv --all --fetch-chunks 로 먼저 받아야 함<br>경로: pub/qracle-chat/objects/${safeParam}/chunks/${String(i).padStart(6,'0')}.bin</div>`;
+          statusEl.textContent = `✗ 청크 없음 ${i}/${chunkCount}`;
+          return;
+        }
+        chunks.push(c);
+        total+=c.length;
+        if((i+1)%3===0) statusEl.textContent = `${Math.floor((i+1)/chunkCount*100)}% ${i+1}/${chunkCount} ${total}B`;
+      }
+      const finalBlob = new Blob(chunks.map(b=>b.buffer.slice(b.byteOffset, b.byteOffset+b.byteLength)), {type: mime});
+      currentBytes = new Uint8Array(await finalBlob.arrayBuffer());
+      currentMime = mime;
+      const url = URL.createObjectURL(finalBlob);
+      viewEl.innerHTML = `<video controls autoplay src="${url}" style="max-width:100%;max-height:92vh"></video>`;
+      sizeEl.textContent = `${finalBlob.size}B ${mime} ${chunkCount} chunks - OPFS chunked assembled`;
+      statusEl.textContent = `✓ OPFS 청크 ${chunkCount}개 조립 완료: ${name} ${finalBlob.size}B p2p=${p2pPath}`;
+      return;
+    }catch(e){
+      viewEl.innerHTML = `<div class=err>chunked 조립 실패: ${e.message}<br>${e.stack}</div>`;
+      return;
+    }
+  }
+
+  if(!opfsPath){ viewEl.innerHTML = `<div class=err>path 없음</div>`; return; }
+  const data = await readFromOpfs(opfsPath);
+  if(!data){ viewEl.innerHTML = `<div class=err>OPFS에 파일 없음:<br>${opfsPath}<br><br>safe 불일치? qracle opfs ls 로 확인</div>`; return; }
+
+  let bytes = data instanceof Uint8Array ? data : (data instanceof ArrayBuffer ? new Uint8Array(data) : new TextEncoder().encode(typeof data==='string'?data:JSON.stringify(data)));
+  currentBytes = bytes;
+
+  const isPNG = bytes[0]===0x89 && bytes[1]===0x50;
+  const isJPG = bytes[0]===0xFF && bytes[1]===0xD8;
+
+  if(isPNG || isJPG || /\.(png|jpg|jpeg|webp|gif)$/i.test(opfsPath)){
+    currentMime = isPNG?'image/png':'image/jpeg';
+    const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset+bytes.byteLength)], {type: currentMime});
+    const url = URL.createObjectURL(blob);
+    viewEl.innerHTML = `<img src="${url}" />`;
+    statusEl.textContent = `✓ OPFS 이미지 ${bytes.length}B p2p=${p2pPath} (주소창 blob 미노출)`;
+  }else if(opfsPath.endsWith('.manifest.json')){
+    try{
+      const manifest = JSON.parse(new TextDecoder().decode(bytes));
+      if(manifest.isChunked){
+        // manifest.json 직접 열렸을 때 - safe로 재귀
+        location.href = `/opfs-browser.html?p=${encodeURIComponent(opfsPath)}&chunked=1&safe=${encodeURIComponent(manifest.safe)}&chunks=${manifest.chunkCount}&mime=${encodeURIComponent(manifest.mime||'video/mp4')}`;
+        return;
+      }
+      viewEl.innerHTML = `<pre>${JSON.stringify(manifest,null,2).slice(0,20000)}</pre>`;
+    }catch(e){ viewEl.innerHTML = `<div class=err>manifest 파싱 실패</div>`; }
+  }else if(/\.(mp4|mov|webm)$/i.test(opfsPath)){
+    currentMime='video/mp4';
+    const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset+bytes.byteLength)], {type:'video/mp4'});
+    viewEl.innerHTML = `<video controls autoplay src="${URL.createObjectURL(blob)}"></video>`;
+  }else{
+    const txt = new TextDecoder().decode(bytes).slice(0,20000);
+    viewEl.innerHTML = `<pre>${txt.replace(/</g,'&lt;')}</pre>`;
+  }
+  sizeEl.textContent = `${bytes.length}B`;
+}
+
+document.getElementById('copy').onclick = ()=>{ navigator.clipboard.writeText(p2pPath); };
+document.getElementById('dl').onclick = ()=>{
+  if(!currentBytes) return;
+  const blob = new Blob([currentBytes.buffer.slice(currentBytes.byteOffset, currentBytes.byteOffset+currentBytes.byteLength)], {type: currentMime||'application/octet-stream'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=opfsPath.split('/').pop()||'download'; a.click();
+};
+render();
+</script>
+</body>
+</html>
