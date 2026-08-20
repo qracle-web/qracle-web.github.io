@@ -7,7 +7,7 @@ const signals = new Map<string, { room: string, type: string, from: string, to: 
 function getCORSHeaders(reqHeaders?: any) {
   return {
     // 'Access-Control-Allow-Origin': '*', // 또는 보안을 위해 특정 도메인 지정: 'https://github.io'
-    'Access-Control-Allow-Origin': 'https://github.io'  
+    'Access-Control-Allow-Origin': 'https://qracle-web.github.io'  
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400', // Preflight(OPTIONS) 요청 캐싱으로 성능 향상
